@@ -1,0 +1,66 @@
+# After any change to this file you MUST regenerate and checkin
+# a .drone-e2e.sec even if no secrets were changed.
+---
+clone:
+  path: github.com/vmware/vic
+  tags: true
+
+build:
+  all:
+    image: golang:1.6.2
+    pull: true
+    environment:
+      BIN: bin
+    commands:
+      - make all
+
+  integration-test:
+    image: golang:1.6.2
+    pull: true
+    environment:
+      BIN: bin
+      GOPATH: /drone
+      SHELL: /bin/bash
+      DOCKER_API_VERSION: "1.21"
+      VIC_ESX_TEST_URL: $$VIC_ESX_TEST_URL
+    commands:
+      - apt-get update && apt-get install -y jq
+      - curl -sSL https://get.docker.com/ | sh
+      - make integration-tests
+    when:
+      success: true
+
+  bundle:
+    image: golang:1.6.2
+    pull: true
+    environment:
+      LOG_TEMP_DIR: install-logs
+      SHELL: /bin/bash
+    commands:
+      - rm -rf $LOG_TEMP_DIR
+      - mkdir $LOG_TEMP_DIR
+      - cp install-*.tar.gz $LOG_TEMP_DIR
+      - tar czvf vic_install_logs_$$BUILD_NUMBER.tar.gz $LOG_TEMP_DIR
+      - shasum -a 256 vic_install_logs_$$BUILD_NUMBER.tar.gz
+
+publish:
+  bintray:
+    username: $$BINTRAY_USERNAME
+    api_key: $$BINTRAY_API_KEY
+    artifacts:
+      - file: vic_install_logs_$$BUILD_NUMBER.tar.gz
+        owner: vmware
+        type: executable
+        repository: vic-private
+        package: build
+        version: $$BUILD_NUMBER
+        target: vic_install_logs_$$BUILD_NUMBER.tar.gz
+        publish: true
+    when:
+      repo: vmware/vic
+      branch: master
+
+cache:
+  mount:
+    - /drone/bin
+    - bin
