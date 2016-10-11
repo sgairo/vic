@@ -52,6 +52,12 @@ const (
 	timeout = time.Duration(2 * time.Second)
 )
 
+type vicAdminConfig struct {
+	session.Config
+	addr string
+	tls  bool
+}
+
 var (
 	logFileDir  = "/var/log/vic"
 	logFileList = []string{
@@ -68,11 +74,7 @@ var (
 		"tether.debug",
 	}
 
-	config struct {
-		session.Config
-		addr string
-		tls  bool
-	}
+	config vicAdminConfig
 
 	resources vchconfig.Resources
 
@@ -388,14 +390,9 @@ func (r datastoreReader) open() (entry, error) {
 	return httpEntry(r.path, res)
 }
 
-func client() (*session.Session, error) {
-	defer trace.End(trace.Begin(""))
-
+func vSphereSessionGet(sessconfig *session.Config) (*session.Session, error) {
+	session := session.NewSession(sessconfig)
 	ctx := context.Background()
-
-	// TODO: this should be replaced with session.Create so we're
-	// not overriding the parameters from vchconfig
-	session := session.NewSession(&config.Config)
 	_, err := session.Connect(ctx)
 	if err != nil {
 		log.Warnf("Unable to connect: %s", err)
@@ -407,14 +404,22 @@ func client() (*session.Session, error) {
 		// no a critical error for vicadmin
 		log.Warnf("Unable to populate session: %s", err)
 	}
-
 	return session, nil
+}
+
+func client(config *vicAdminConfig) (*session.Session, error) {
+	defer trace.End(trace.Begin(""))
+	sess, err := vSphereSessionGet(&config.Config)
+	if err != nil {
+		return nil, err
+	}
+	return sess, nil
 }
 
 func findDatastore() error {
 	defer trace.End(trace.Begin(""))
 
-	session, err := client()
+	session, err := client(&config)
 	if err != nil {
 		return err
 	}

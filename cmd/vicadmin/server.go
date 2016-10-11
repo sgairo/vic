@@ -27,11 +27,16 @@ import (
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/docker/docker/pkg/tlsconfig"
+	gorillacontext "github.com/gorilla/context"
+	"github.com/gorilla/securecookie"
+	"github.com/gorilla/sessions"
 
 	"crypto/x509"
-
+	"github.com/vmware/govmomi/vim25/soap"
 	"github.com/vmware/vic/lib/vicadmin"
 	"github.com/vmware/vic/pkg/trace"
+	"github.com/vmware/vic/pkg/vsphere/session"
+	"net/url"
 )
 
 type server struct {
@@ -46,6 +51,8 @@ const (
 	formatTGZ format = iota
 	formatZip
 )
+
+var store = sessions.NewCookieStore([]byte(securecookie.GenerateRandomKey(64)))
 
 func (s *server) listen() error {
 	defer trace.End(trace.Begin(""))
@@ -112,39 +119,122 @@ func (s *server) listenPort() int {
 	return s.l.Addr().(*net.TCPAddr).Port
 }
 
+// Enforces authentication on route `link` and runs `handler` on successful auth
+func (s *server) AuthenticatedHandle(link string, h http.Handler) {
+	s.Authenticated(link, h.ServeHTTP)
+}
+
+func (s *server) Handle(link string, h http.Handler) {
+	s.mux.Handle(link, gorillacontext.ClearHandler(h))
+}
+
+// Enforces authentication on route `link` and runs `handler` on successful auth
+func (s *server) Authenticated(link string, handler func(http.ResponseWriter, *http.Request)) {
+	defer trace.End(trace.Begin(""))
+
+	authHandler := func(w http.ResponseWriter, r *http.Request) {
+		websession, err := store.Get(r, "secret-store")
+		// "authenticate" if any cookie is present (HACK TODO FIXME)
+		if len(r.TLS.PeerCertificates) == 0 && websession.Values["foo"] != "bar" {
+			// if err != nil, then no authentication cookie is set
+			log.Infof("No cookie found: %s", err)
+			if err != nil {
+				log.Infof("Secret store was empty, but that's expected?")
+			}
+			http.Redirect(w, r, "/authentication", 302)
+			return
+		}
+		handler(w, r)
+	}
+	s.mux.Handle(link, gorillacontext.ClearHandler(http.HandlerFunc(authHandler)))
+}
+
+// renders the page for login and handles authorization requests
+func (s *server) loginPage(res http.ResponseWriter, req *http.Request) {
+	defer trace.End(trace.Begin(""))
+	ctx := context.Background()
+	if req.Method == "POST" {
+		// take the form data and use it to try to authenticate with vsphere
+		// create a userconfig
+		userconfig := session.Config{
+			Insecure:       false,
+			Thumbprint:     config.Thumbprint,
+			Keepalive:      config.Keepalive,
+			ClusterPath:    config.ClusterPath,
+			DatacenterPath: config.DatacenterPath,
+			DatastorePath:  config.DatastorePath,
+			HostPath:       config.Config.HostPath,
+			PoolPath:       config.PoolPath,
+		}
+		user := url.UserPassword(req.FormValue("username"), req.FormValue("password"))
+		serviceURL, err := soap.ParseURL(config.Service)
+		if err != nil {
+			log.Errorf("vSphere service URL was not a valid format; parsing returned error: %s", err)
+		}
+		serviceURL.User = user
+		userconfig.Service = serviceURL.String()
+
+		// then, create a session:
+
+		_, err = vSphereSessionGet(&userconfig)
+		if err != nil {
+			// something went wrong or we could not authenticate
+			http.Redirect(res, req, "/authentication?unauthorized", 302)
+		}
+
+		websession, _ := store.Get(req, "secret-store")
+		websession.Values["foo"] = "bar"
+		websession.Save(req, res)
+
+		http.Redirect(res, req, "/", 302)
+	}
+
+	sess, err := client(&config)
+	v := vicadmin.NewValidator(ctx, &vchConfig, sess)
+	tmpl, err := template.ParseFiles("auth.html")
+	err = tmpl.ExecuteTemplate(res, "auth.html", v)
+	if err != nil {
+		log.Errorf("Error parsing template: %s", err)
+	}
+}
+
 func (s *server) serve() error {
 	defer trace.End(trace.Begin(""))
 
 	s.mux = http.NewServeMux()
 
+	// s.mux.HandleFunc bypasses authentication
+	s.mux.HandleFunc("/authentication", s.loginPage)
+
 	// tar of appliance system logs
-	s.mux.HandleFunc("/logs.tar.gz", s.tarDefaultLogs)
-	s.mux.HandleFunc("/logs.zip", s.zipDefaultLogs)
+	s.Authenticated("/logs.tar.gz", s.tarDefaultLogs)
+	s.Authenticated("/logs.zip", s.zipDefaultLogs)
 
 	// tar of appliance system logs + container logs
-	s.mux.HandleFunc("/container-logs.tar.gz", s.tarContainerLogs)
-	s.mux.HandleFunc("/container-logs.zip", s.zipContainerLogs)
+	s.Authenticated("/container-logs.tar.gz", s.tarContainerLogs)
+	s.Authenticated("/container-logs.zip", s.zipContainerLogs)
 
-	s.mux.Handle("/css/", http.StripPrefix("/css/", http.FileServer(http.Dir("css/"))))
-	s.mux.Handle("/images/", http.StripPrefix("/images/", http.FileServer(http.Dir("images/"))))
-	s.mux.Handle("/fonts/", http.StripPrefix("/fonts/", http.FileServer(http.Dir("fonts/"))))
+	// these assets bypass authentication & are world-readable
+	s.Handle("/css/", http.StripPrefix("/css/", http.FileServer(http.Dir("css/"))))
+	s.Handle("/images/", http.StripPrefix("/images/", http.FileServer(http.Dir("images/"))))
+	s.Handle("/fonts/", http.StripPrefix("/fonts/", http.FileServer(http.Dir("fonts/"))))
 
 	for _, path := range logFiles() {
 		name := filepath.Base(path)
 		p := path
 
 		// get single log file (no tail)
-		s.mux.HandleFunc("/logs/"+name, func(w http.ResponseWriter, r *http.Request) {
+		s.Authenticated("/logs/"+name, func(w http.ResponseWriter, r *http.Request) {
 			http.ServeFile(w, r, p)
 		})
 
 		// get single log file (with tail)
-		s.mux.HandleFunc("/logs/tail/"+name, func(w http.ResponseWriter, r *http.Request) {
+		s.Authenticated("/logs/tail/"+name, func(w http.ResponseWriter, r *http.Request) {
 			s.tailFiles(w, r, []string{p})
 		})
 	}
 
-	s.mux.HandleFunc("/", s.index)
+	s.Authenticated("/", s.index)
 	server := &http.Server{
 		Handler: s.mux,
 	}
@@ -172,7 +262,7 @@ func (s *server) bundleContainerLogs(res http.ResponseWriter, req *http.Request,
 	readers := defaultReaders
 
 	if config.Service != "" {
-		c, err := client()
+		c, err := client(&config)
 		if err != nil {
 			log.Errorf("failed to connect: %s", err)
 		} else {
@@ -266,7 +356,7 @@ func (s *server) tailFiles(res http.ResponseWriter, req *http.Request, names []s
 func (s *server) index(res http.ResponseWriter, req *http.Request) {
 	defer trace.End(trace.Begin(""))
 	ctx := context.Background()
-	sess, err := client()
+	sess, err := client(&config)
 	v := vicadmin.NewValidator(ctx, &vchConfig, sess)
 
 	tmpl, err := template.ParseFiles("dashboard.html")
