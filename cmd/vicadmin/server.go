@@ -37,6 +37,7 @@ import (
 	"github.com/vmware/vic/pkg/trace"
 	"github.com/vmware/vic/pkg/vsphere/session"
 	"net/url"
+	"time"
 )
 
 type server struct {
@@ -51,8 +52,10 @@ const (
 	formatTGZ format = iota
 	formatZip
 )
+const sessionExpiration = time.Hour * 24
 
 var store = sessions.NewCookieStore([]byte(securecookie.GenerateRandomKey(64)))
+var userSessions = make(map[string]*session.Session)
 
 func (s *server) listen() error {
 	defer trace.End(trace.Begin(""))
@@ -128,22 +131,42 @@ func (s *server) Handle(link string, h http.Handler) {
 	s.mux.Handle(link, gorillacontext.ClearHandler(h))
 }
 
+func (s *server) checkCookie() bool {
+	hashKey := securecookie.GenerateRandomKey(64)
+	blockKey := securecookie.GenerateRandomKey(64)
+	securecookie.New(hashKey, blockKey)
+	return false
+}
+
 // Enforces authentication on route `link` and runs `handler` on successful auth
 func (s *server) Authenticated(link string, handler func(http.ResponseWriter, *http.Request)) {
 	defer trace.End(trace.Begin(""))
 
 	authHandler := func(w http.ResponseWriter, r *http.Request) {
-		websession, err := store.Get(r, "secret-store")
-		// "authenticate" if any cookie is present (HACK TODO FIXME)
-		if len(r.TLS.PeerCertificates) == 0 && websession.Values["foo"] != "bar" {
-			// if err != nil, then no authentication cookie is set
-			log.Infof("No cookie found: %s", err)
-			if err != nil {
-				log.Infof("Secret store was empty, but that's expected?")
-			}
+		websession, _ := store.Get(r, "sessiondata")
+		if len(r.TLS.PeerCertificates) > 0 {
+			// a certificate is present and the correct one was already verified by Go's HTTP server
+			// so the user is authenticated
+			handler(w, r)
+			return
+		}
+
+		c := websession.Values["created"]
+		if c == nil {
+			// no cookie, so redirect to login
 			http.Redirect(w, r, "/authentication", 302)
 			return
 		}
+
+		// parse the cookie creation time
+		created, _ := time.Parse(time.RFC3339, c.(string))
+		if len(r.TLS.PeerCertificates) == 0 && time.Since(created) > sessionExpiration {
+			// token is expired, so redirect to login
+			http.Redirect(w, r, "/authentication?expired", 302)
+			return
+		}
+
+		// if the date on the cookie was valid, then the user is authenticated
 		handler(w, r)
 	}
 	s.mux.Handle(link, gorillacontext.ClearHandler(http.HandlerFunc(authHandler)))
@@ -176,14 +199,16 @@ func (s *server) loginPage(res http.ResponseWriter, req *http.Request) {
 
 		// then, create a session:
 
-		_, err = vSphereSessionGet(&userconfig)
+		usersession, err := vSphereSessionGet(&userconfig)
 		if err != nil {
 			// something went wrong or we could not authenticate
 			http.Redirect(res, req, "/authentication?unauthorized", 302)
 		}
+		userSessions[req.FormValue("username")] = usersession
 
-		websession, _ := store.Get(req, "secret-store")
-		websession.Values["foo"] = "bar"
+		websession, _ := store.Get(req, "sessiondata")
+		timeNow, _ := time.Now().MarshalText()
+		websession.Values["created"] = string(timeNow)
 		websession.Save(req, res)
 
 		http.Redirect(res, req, "/", 302)
