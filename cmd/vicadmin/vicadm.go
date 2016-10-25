@@ -74,7 +74,9 @@ var (
 		"tether.debug",
 	}
 
-	config vicAdminConfig
+	// this struct holds root credentials or vSphere extension private key instead if available
+	// if you are exposing log information to a user, create a new session for that user, do not use this one
+	rootConfig vicAdminConfig
 
 	resources vchconfig.Resources
 
@@ -401,10 +403,19 @@ func vSphereSessionGet(sessconfig *session.Config) (*session.Session, error) {
 
 	_, err = session.Populate(ctx)
 	if err != nil {
-		// no a critical error for vicadmin
+		// not a critical error for vicadmin
 		log.Warnf("Unable to populate session: %s", err)
 	}
 	return session, nil
+}
+
+func (s *server) getSessionFromRequest(r *http.Request) (*session.Session, error) {
+	sessionData := getSessionCookie(r)
+	c, err := s.uss.GetSession(sessionData.Values["username"].(string))
+	if err != nil {
+		return nil, err
+	}
+	return c, err
 }
 
 func client(config *vicAdminConfig) (*session.Session, error) {
@@ -419,7 +430,7 @@ func client(config *vicAdminConfig) (*session.Session, error) {
 func findDatastore() error {
 	defer trace.End(trace.Begin(""))
 
-	session, err := client(&config)
+	session, err := client(&rootConfig)
 	if err != nil {
 		return err
 	}
@@ -462,23 +473,23 @@ func main() {
 	}
 
 	// FIXME: these should just be consumed directly inside Session
-	config.Service = vchConfig.Target.String()
-	config.ExtensionCert = vchConfig.ExtensionCert
-	config.ExtensionKey = vchConfig.ExtensionKey
-	config.ExtensionName = vchConfig.ExtensionName
-	config.Thumbprint = vchConfig.TargetThumbprint
-	config.DatastorePath = vchConfig.Storage.ImageStores[0].Host
+	rootConfig.Service = vchConfig.Target.String()
+	rootConfig.ExtensionCert = vchConfig.ExtensionCert
+	rootConfig.ExtensionKey = vchConfig.ExtensionKey
+	rootConfig.ExtensionName = vchConfig.ExtensionName
+	rootConfig.Thumbprint = vchConfig.TargetThumbprint
+	rootConfig.DatastorePath = vchConfig.Storage.ImageStores[0].Host
 
 	if vchConfig.Diagnostics.DebugLevel > 2 {
 		config.addr = "0.0.0.0:2378"
 		log.Warn("Listening on all networks because of debug level")
 	}
-
 	s := &server{
-		addr: config.addr,
+		addr: rootConfig.addr,
 	}
 
 	err := s.listen()
+
 	if err != nil {
 		log.Fatal(err)
 	}

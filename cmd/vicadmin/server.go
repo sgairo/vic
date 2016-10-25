@@ -37,6 +37,7 @@ import (
 	"github.com/vmware/vic/pkg/trace"
 	"github.com/vmware/vic/pkg/vsphere/session"
 	"net/url"
+	"sync"
 	"time"
 )
 
@@ -44,6 +45,7 @@ type server struct {
 	l    net.Listener
 	addr string
 	mux  *http.ServeMux
+	uss  *UserSessionStore
 }
 
 type format int
@@ -52,15 +54,79 @@ const (
 	formatTGZ format = iota
 	formatZip
 )
+
 const sessionExpiration = time.Hour * 24
+const sessionCookieKey = "sessiondata"
+
+// UserSession holds a user's session metadata
+type UserSession struct {
+	username string
+	created  time.Time
+	config   *session.Config
+}
+
+// UserSessionStore holds and manages user sessions
+type UserSessionStore struct {
+	*sync.Mutex
+	sessions map[string]*UserSession
+	ticker   *time.Ticker
+}
+
+func (u *UserSessionStore) Add(username string, config *session.Config) *UserSession {
+	u.Lock()
+	defer u.Unlock()
+	u.sessions[username] = &UserSession{
+		username: username,
+		created:  time.Now(),
+		config:   config,
+	}
+	return u.sessions[username]
+}
+
+func (u *UserSessionStore) Delete(username string) {
+	u.Lock()
+	defer u.Unlock()
+	delete(u.sessions, username)
+}
+
+func (u *UserSessionStore) Get(username string) *UserSession {
+	return u.sessions[username]
+}
+
+// GetSession logs into vSphere and returns a session object. Caller responsible for error handling/logout
+func (u *UserSessionStore) GetSession(username string) (vSphereSession *session.Session, err error) {
+	return vSphereSessionGet(u.Get(username).config)
+}
+
+// reaper takes abandoned sessions to a farm upstate so they don't build up forever
+func (u *UserSessionStore) reaper() {
+	select {
+	case <-u.ticker.C:
+		for username, session := range u.sessions {
+			if time.Since(session.created) > sessionExpiration {
+				u.Delete(username)
+			}
+		}
+	}
+}
+
+// NewUserSessionStore creates & initializes a UserSessionStore and starts a session reaper in the background
+func NewUserSessionStore() *UserSessionStore {
+	u := &UserSessionStore{
+		sessions: make(map[string]*UserSession),
+		ticker:   time.NewTicker(time.Minute),
+	}
+	go u.reaper()
+	return u
+}
 
 var store = sessions.NewCookieStore([]byte(securecookie.GenerateRandomKey(64)))
-var userSessions = make(map[string]*session.Session)
 
 func (s *server) listen() error {
 	defer trace.End(trace.Begin(""))
 
 	var err error
+	s.uss = NewUserSessionStore()
 
 	certificate, err := vchConfig.HostCertificate.Certificate()
 	if err != nil {
@@ -131,37 +197,34 @@ func (s *server) Handle(link string, h http.Handler) {
 	s.mux.Handle(link, gorillacontext.ClearHandler(h))
 }
 
-func (s *server) checkCookie() bool {
-	hashKey := securecookie.GenerateRandomKey(64)
-	blockKey := securecookie.GenerateRandomKey(64)
-	securecookie.New(hashKey, blockKey)
-	return false
-}
-
 // Enforces authentication on route `link` and runs `handler` on successful auth
 func (s *server) Authenticated(link string, handler func(http.ResponseWriter, *http.Request)) {
 	defer trace.End(trace.Begin(""))
 
 	authHandler := func(w http.ResponseWriter, r *http.Request) {
-		websession, _ := store.Get(r, "sessiondata")
-		if len(r.TLS.PeerCertificates) > 0 {
-			// a certificate is present and the correct one was already verified by Go's HTTP server
-			// so the user is authenticated
+		websession, _ := store.Get(r, sessionCookieKey)
+
+		if len(r.TLS.PeerCertificates) > 0 { // the user is authenticated by certificate at connection time
+			usersess := s.uss.Add("root", &rootConfig.Config)
+			websession, _ := store.Get(r, sessionCookieKey)
+			timeNow, _ := usersess.created.MarshalText()
+			websession.Values["created"] = string(timeNow)
+			websession.Values["username"] = "root"
+			websession.Save(r, w)
 			handler(w, r)
 			return
 		}
 
 		c := websession.Values["created"]
-		if c == nil {
-			// no cookie, so redirect to login
+		if c == nil { // no cookie, so redirect to login
 			http.Redirect(w, r, "/authentication", 302)
 			return
 		}
 
 		// parse the cookie creation time
 		created, _ := time.Parse(time.RFC3339, c.(string))
-		if len(r.TLS.PeerCertificates) == 0 && time.Since(created) > sessionExpiration {
-			// token is expired, so redirect to login
+
+		if time.Since(created) > sessionExpiration { // cookie exists but is expired
 			http.Redirect(w, r, "/authentication?expired", 302)
 			return
 		}
@@ -178,43 +241,53 @@ func (s *server) loginPage(res http.ResponseWriter, req *http.Request) {
 	ctx := context.Background()
 	if req.Method == "POST" {
 		// take the form data and use it to try to authenticate with vsphere
+
 		// create a userconfig
 		userconfig := session.Config{
 			Insecure:       false,
-			Thumbprint:     config.Thumbprint,
-			Keepalive:      config.Keepalive,
-			ClusterPath:    config.ClusterPath,
-			DatacenterPath: config.DatacenterPath,
-			DatastorePath:  config.DatastorePath,
-			HostPath:       config.Config.HostPath,
-			PoolPath:       config.PoolPath,
+			Thumbprint:     rootConfig.Thumbprint,
+			Keepalive:      rootConfig.Keepalive,
+			ClusterPath:    rootConfig.ClusterPath,
+			DatacenterPath: rootConfig.DatacenterPath,
+			DatastorePath:  rootConfig.DatastorePath,
+			HostPath:       rootConfig.Config.HostPath,
+			PoolPath:       rootConfig.PoolPath,
 		}
 		user := url.UserPassword(req.FormValue("username"), req.FormValue("password"))
-		serviceURL, err := soap.ParseURL(config.Service)
+		serviceURL, err := soap.ParseURL(rootConfig.Service)
 		if err != nil {
 			log.Errorf("vSphere service URL was not a valid format; parsing returned error: %s", err)
 		}
 		serviceURL.User = user
 		userconfig.Service = serviceURL.String()
 
-		// then, create a session:
-
+		// check login
 		usersession, err := vSphereSessionGet(&userconfig)
 		if err != nil {
 			// something went wrong or we could not authenticate
 			http.Redirect(res, req, "/authentication?unauthorized", 302)
 		}
-		userSessions[req.FormValue("username")] = usersession
 
-		websession, _ := store.Get(req, "sessiondata")
-		timeNow, _ := time.Now().MarshalText()
+		// successful login above; user is authenticated
+		// log out
+		usersession.Client.Logout(context.Background())
+
+		// save user config locally
+		usersess := s.uss.Add(req.FormValue("username"), &userconfig)
+
+		// create a token to save as an encrypted & signed cookie
+		websession, _ := store.Get(req, sessionCookieKey)
+		timeNow, _ := usersess.created.MarshalText()
 		websession.Values["created"] = string(timeNow)
+		websession.Values["username"] = req.FormValue("username")
 		websession.Save(req, res)
 
+		// redirect to dashboard
 		http.Redirect(res, req, "/", 302)
 	}
 
-	sess, err := client(&config)
+	// Render login page (shows up on non-POST requests):
+	sess, err := client(&rootConfig)
 	v := vicadmin.NewValidator(ctx, &vchConfig, sess)
 	tmpl, err := template.ParseFiles("auth.html")
 	err = tmpl.ExecuteTemplate(res, "auth.html", v)
@@ -281,36 +354,35 @@ func (s *server) stop() error {
 	return nil
 }
 
+func getSessionCookie(req *http.Request) *sessions.Session {
+	cookieSessionData, _ := store.Get(req, sessionCookieKey)
+	return cookieSessionData
+}
+
 func (s *server) bundleContainerLogs(res http.ResponseWriter, req *http.Request, f format) {
 	defer trace.End(trace.Begin(""))
 
 	readers := defaultReaders
+	c, err := s.getSessionFromRequest(req)
 
-	if config.Service != "" {
-		c, err := client(&config)
-		if err != nil {
-			log.Errorf("failed to connect: %s", err)
-		} else {
-			// Note: we don't want to Logout() until tarEntries() completes below
-			defer c.Client.Logout(context.Background())
+	// Note: we don't want to Logout() until tarEntries() completes below
+	defer c.Client.Logout(context.Background())
 
-			logs, err := findDatastoreLogs(c)
-			if err != nil {
-				log.Warningf("error searching datastore: %s", err)
-			} else {
-				for key, rdr := range logs {
-					readers[key] = rdr
-				}
-			}
+	logs, err := findDatastoreLogs(c)
+	if err != nil {
+		log.Warningf("error searching datastore: %s", err)
+	} else {
+		for key, rdr := range logs {
+			readers[key] = rdr
+		}
+	}
 
-			logs, err = findDiagnosticLogs(c)
-			if err != nil {
-				log.Warningf("error collecting diagnostic logs: %s", err)
-			} else {
-				for key, rdr := range logs {
-					readers[key] = rdr
-				}
-			}
+	logs, err = findDiagnosticLogs(c)
+	if err != nil {
+		log.Warningf("error collecting diagnostic logs: %s", err)
+	} else {
+		for key, rdr := range logs {
+			readers[key] = rdr
 		}
 	}
 
@@ -381,7 +453,7 @@ func (s *server) tailFiles(res http.ResponseWriter, req *http.Request, names []s
 func (s *server) index(res http.ResponseWriter, req *http.Request) {
 	defer trace.End(trace.Begin(""))
 	ctx := context.Background()
-	sess, err := client(&config)
+	sess, err := s.getSessionFromRequest(req)
 	v := vicadmin.NewValidator(ctx, &vchConfig, sess)
 
 	tmpl, err := template.ParseFiles("dashboard.html")
