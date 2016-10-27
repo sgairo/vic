@@ -15,9 +15,14 @@
 package main
 
 import (
-	"github.com/vmware/vic/pkg/vsphere/session"
 	"sync"
 	"time"
+
+	log "github.com/Sirupsen/logrus"
+	"github.com/gorilla/securecookie"
+	"github.com/gorilla/sessions"
+
+	"github.com/vmware/vic/pkg/vsphere/session"
 )
 
 // UserSession holds a user's session metadata
@@ -32,6 +37,7 @@ type UserSessionStore struct {
 	mutex    sync.RWMutex
 	sessions map[string]*UserSession
 	ticker   *time.Ticker
+	cookies  *sessions.CookieStore
 }
 
 type UserSessionStorer interface {
@@ -72,8 +78,8 @@ func (u *UserSessionStore) VSphere(username string) (vSphereSession *session.Ses
 
 // reaper takes abandoned sessions to a farm upstate so they don't build up forever
 func (u *UserSessionStore) reaper() {
-	select {
-	case <-u.ticker.C:
+	for range u.ticker.C {
+		log.Infof("Reaping old sessions..")
 		for username, session := range u.sessions {
 			if time.Since(session.created) > sessionExpiration {
 				u.Delete(username)
@@ -88,6 +94,7 @@ func NewUserSessionStore() *UserSessionStore {
 		sessions: make(map[string]*UserSession),
 		ticker:   time.NewTicker(time.Minute),
 		mutex:    sync.RWMutex{},
+		cookies:  sessions.NewCookieStore([]byte(securecookie.GenerateRandomKey(64)), []byte(securecookie.GenerateRandomKey(32))),
 	}
 	go u.reaper()
 	return u

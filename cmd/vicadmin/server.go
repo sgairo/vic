@@ -31,7 +31,6 @@ import (
 	log "github.com/Sirupsen/logrus"
 	"github.com/docker/docker/pkg/tlsconfig"
 	gorillacontext "github.com/gorilla/context"
-	"github.com/gorilla/securecookie"
 	"github.com/gorilla/sessions"
 
 	"github.com/vmware/govmomi/vim25/soap"
@@ -54,20 +53,26 @@ const (
 	formatZip
 )
 
-const sessionExpiration = time.Hour * 24
-const sessionCookieKey = "sessiondata"
-const loginPagePath = "/authentication"
-const authFailure = loginPagePath + "?unauthorized"
-
-// store is signed with first argument and encrypted w/ second
-var store = sessions.NewCookieStore([]byte(securecookie.GenerateRandomKey(64)),
-	[]byte(securecookie.GenerateRandomKey(32)))
+const (
+	sessionExpiration      = time.Hour * 24
+	sessionCookieKey       = "sessiondata"
+	sessionCreationTimeKey = "created"
+	sessionUsernameKey     = "username"
+	loginPagePath          = "/authentication"
+	authFailure            = loginPagePath + "?unauthorized"
+)
 
 func (s *server) listen() error {
 	defer trace.End(trace.Begin(""))
 
 	var err error
 	s.uss = NewUserSessionStore()
+	s.uss.cookies.Options = &sessions.Options{
+		Path:     "/",
+		MaxAge:   3600 * 24,
+		Secure:   true,
+		HttpOnly: true,
+	}
 
 	certificate, err := vchConfig.HostCertificate.Certificate()
 	if err != nil {
@@ -143,43 +148,55 @@ func (s *server) Authenticated(link string, handler func(http.ResponseWriter, *h
 	defer trace.End(trace.Begin(""))
 
 	authHandler := func(w http.ResponseWriter, r *http.Request) {
-		websession, _ := store.Get(r, sessionCookieKey) // ignore error because it is okay if it doesn't exist
+		websession, _ := s.uss.cookies.Get(r, sessionCookieKey) // ignore error because it is okay if it doesn't exist
 
 		if len(r.TLS.PeerCertificates) > 0 { // the user is authenticated by certificate at connection time
 			usersess := s.uss.Add("root", &rootConfig.Config)
 
 			timeNow, err := usersess.created.MarshalText()
 			if err != nil {
-				// the only way (that I can think of!) this could happen is if the cookie is tampered with
-				// so we'll just treat this error as an auth failure
+				// it's probably safe to ignore this error since we just created usersess.created when we called Add() above
+				// but just in case..
 				log.Errorf("Failed to unmarshal time object %+v into text due to error: %s", usersess.created, err)
 				http.Redirect(w, r, authFailure, 302)
 				return
 			}
 
-			websession.Values["created"] = string(timeNow)
-			websession.Values["username"] = "root"
+			websession.Values[sessionCreationTimeKey] = string(timeNow)
+			websession.Values[sessionUsernameKey] = "root"
 			err = websession.Save(r, w)
 			if err != nil {
 				log.Errorf("Could not create session for user authenticated via client certificate due to error \"%s\"", err.Error())
 				http.Redirect(w, r, authFailure, 302)
 				return
 			}
+
+			// user was authenticated via cert
 			handler(w, r)
 			return
 		}
 
-		c := websession.Values["created"]
+		c := websession.Values[sessionCreationTimeKey]
 		if c == nil { // no cookie, so redirect to login
 			log.Errorf("No authentication token: %+v", websession.Values)
 			http.Redirect(w, r, authFailure, 302)
 			return
 		}
 
+		// here we have a cookie, but we need to make sure it's not expired:
 		// parse the cookie creation time
-		created, _ := time.Parse(time.RFC3339, c.(string))
+		created, err := time.Parse(time.RFC3339, c.(string))
+		if err != nil {
+			// we pulled this value out of a cookie, so if it doesn't parse, it might've been tampered with
+			// though the cookie's encrypted so that would destroy the whole cookie..
+			// Handling the error in any case:
+			log.Errorf("Couldn't parse time out of retrieved cookie due to error %s", err.Error())
+			http.Redirect(w, r, authFailure, 302)
+			return
+		}
 
-		if time.Since(created) > sessionExpiration { // cookie exists but is expired
+		// cookie exists but is expired
+		if time.Since(created) > sessionExpiration {
 			http.Redirect(w, r, loginPagePath+"?expired", 302)
 			return
 		}
@@ -238,27 +255,33 @@ func (s *server) loginPage(res http.ResponseWriter, req *http.Request) {
 
 		// create a token to save as an encrypted & signed cookie
 		// ignore error because there will be one if the session store does not exist, however, it will be created
-		websession, _ := store.Get(req, sessionCookieKey)
+		websession, _ := s.uss.cookies.Get(req, sessionCookieKey)
 
 		timeNow, err := usersess.created.MarshalText()
 		if err != nil {
 			log.Errorf("Failed to unmarshal time object %+v into text due to error: %s", usersess.created, err)
-
+			http.Redirect(res, req, authFailure, 500)
+			return
 		}
-		websession.Values["created"] = string(timeNow)
-		websession.Values["username"] = req.FormValue("username")
+		websession.Values[sessionCreationTimeKey] = string(timeNow)
+		websession.Values[sessionUsernameKey] = req.FormValue("username")
 		if err := websession.Save(req, res); err != nil {
 			log.Errorf("\"%s\" occurred while trying to save session to browser", err.Error())
+			http.Redirect(res, req, authFailure, 500)
+			return
 		}
 
 		// redirect to dashboard
 		http.Redirect(res, req, "/", 302)
+		return
 	}
 
 	// Render login page (shows up on non-POST requests):
 	sess, err := client(&rootConfig)
 	if err != nil {
 		log.Errorf("Could not render login page due to vSphere connection error: %s", err.Error())
+		http.Redirect(res, req, "/", 500)
+		return
 	}
 	v := vicadmin.NewValidator(ctx, &vchConfig, sess)
 	tmpl, err := template.ParseFiles("auth.html")
@@ -306,6 +329,7 @@ func (s *server) serve() error {
 		})
 	}
 
+	s.Authenticated("/logout", s.logoutHandler)
 	s.Authenticated("/", s.index)
 	server := &http.Server{
 		Handler: s.mux,
@@ -326,6 +350,27 @@ func (s *server) stop() error {
 	}
 
 	return nil
+}
+
+// logout handler expires the user's session cookie by setting its creation time to the beginning of time
+func (s *server) logoutHandler(res http.ResponseWriter, req *http.Request) {
+	websession, err := s.uss.cookies.Get(req, sessionCookieKey)
+	if err != nil {
+		// if there's no session store, probably calling logout doesn't make much sense
+		http.Redirect(res, req, authFailure, 302)
+		return
+	}
+
+	// ignore parsing/marshalling errors because we're parsing a hardcoded beginning-of-time string
+	beginningOfTime, _ := time.Parse(time.RFC3339, "1970-01-01T00:00:00Z")
+	timeText, _ := beginningOfTime.MarshalText()
+	websession.Values[sessionCreationTimeKey] = string(timeText)
+	if err := websession.Save(req, res); err != nil {
+		http.Redirect(res, req, "/", 500)
+		return
+	}
+	s.uss.Delete(websession.Values[sessionUsernameKey].(string))
+	http.Redirect(res, req, "/", 302)
 }
 
 func (s *server) bundleContainerLogs(res http.ResponseWriter, req *http.Request, f format) {
@@ -421,13 +466,6 @@ func (s *server) tailFiles(res http.ResponseWriter, req *http.Request, names []s
 
 func (s *server) index(res http.ResponseWriter, req *http.Request) {
 	defer trace.End(trace.Begin(""))
-	store.Options = &sessions.Options{
-		Path:     "/",
-		MaxAge:   3600 * 24,
-		Secure:   true,
-		HttpOnly: true,
-	}
-
 	ctx := context.Background()
 	sess, err := s.getSessionFromRequest(req)
 	v := vicadmin.NewValidator(ctx, &vchConfig, sess)

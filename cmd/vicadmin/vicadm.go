@@ -410,8 +410,12 @@ func vSphereSessionGet(sessconfig *session.Config) (*session.Session, error) {
 }
 
 func (s *server) getSessionFromRequest(r *http.Request) (*session.Session, error) {
-	sessionData := getSessionCookie(r)
-	c, err := s.uss.VSphere(sessionData.Values["username"].(string))
+	sessionData, err := s.uss.cookies.Get(r, sessionCookieKey)
+	if err != nil {
+		return nil, err
+	}
+
+	c, err := s.uss.VSphere(sessionData.Values[sessionUsernameKey].(string))
 	if err != nil {
 		return nil, err
 	}
