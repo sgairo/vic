@@ -18,25 +18,32 @@ import (
 	"archive/zip"
 	"compress/gzip"
 	"crypto/tls"
+	"crypto/x509"
 	"html/template"
 	"net"
 	"net/http"
+	"net/url"
 	"path/filepath"
+	"time"
 
 	"golang.org/x/net/context"
 
 	log "github.com/Sirupsen/logrus"
 	"github.com/docker/docker/pkg/tlsconfig"
+	gorillacontext "github.com/gorilla/context"
+	"github.com/gorilla/sessions"
 
+	"github.com/vmware/govmomi/vim25/soap"
 	"github.com/vmware/vic/lib/vicadmin"
 	"github.com/vmware/vic/pkg/trace"
+	"github.com/vmware/vic/pkg/vsphere/session"
 )
 
 type server struct {
-	auth Authenticator
 	l    net.Listener
 	addr string
 	mux  *http.ServeMux
+	uss  *UserSessionStore
 }
 
 type format int
@@ -46,13 +53,50 @@ const (
 	formatZip
 )
 
-func (s *server) listen(useTLS bool) error {
+const (
+	sessionExpiration      = time.Hour * 24
+	sessionCookieKey       = "sessiondata"
+	sessionCreationTimeKey = "created"
+	sessionUsernameKey     = "username"
+	loginPagePath          = "/authentication"
+	authFailure            = loginPagePath + "?unauthorized"
+)
+
+func (s *server) listen() error {
 	defer trace.End(trace.Begin(""))
 
 	var err error
+	s.uss = NewUserSessionStore()
+	s.uss.cookies.Options = &sessions.Options{
+		Path:     "/",
+		MaxAge:   3600 * 24,
+		Secure:   true,
+		HttpOnly: true,
+	}
+
+	certificate, err := vchConfig.HostCertificate.Certificate()
+	if err != nil {
+		log.Errorf("Could not load certificate from config - running without TLS: %s", err)
+
+		s.l, err = net.Listen("tcp", s.addr)
+		return err
+	}
 
 	// FIXME: assignment copies lock value to tlsConfig: crypto/tls.Config contains sync.Once contains sync.Mutex
 	tlsconfig := func(c *tls.Config) *tls.Config {
+		// if there are CAs, then TLS is enabled
+		if len(vchConfig.CertificateAuthorities) != 0 {
+			if c.ClientCAs == nil {
+				c.ClientCAs = x509.NewCertPool()
+			}
+			if !c.ClientCAs.AppendCertsFromPEM(vchConfig.CertificateAuthorities) {
+				log.Errorf("Unable to load CAs from config; client auth via certificate will not function")
+			}
+			c.ClientAuth = tls.RequireAndVerifyClientCert
+		} else {
+			log.Warnf("No certificate authorities found for certificate-based authentication. This may be intentional, however, authentication is disabled")
+		}
+
 		return &tls.Config{
 			Certificates:             c.Certificates,
 			NameToCertificate:        c.NameToCertificate,
@@ -74,18 +118,7 @@ func (s *server) listen(useTLS bool) error {
 		}
 	}(&tlsconfig.ServerDefault)
 
-	certificate, err := vchConfig.HostCertificate.Certificate()
-	if err != nil {
-		log.Errorf("Could not load certificate from config - running without TLS: %s", err)
-		// TODO: add static web page with the vic
-	} else {
-		tlsconfig.Certificates = []tls.Certificate{*certificate}
-	}
-
-	if !useTLS || err != nil {
-		s.l, err = net.Listen("tcp", s.addr)
-		return err
-	}
+	tlsconfig.Certificates = []tls.Certificate{*certificate}
 
 	innerListener, err := net.Listen("tcp", s.addr)
 	if err != nil {
@@ -101,25 +134,163 @@ func (s *server) listenPort() int {
 	return s.l.Addr().(*net.TCPAddr).Port
 }
 
-// handleFunc does preparatory work and then calls the HandleFunc method owned by the HTTP multiplexer
-func (s *server) handleFunc(link string, handler func(http.ResponseWriter, *http.Request)) {
+// Enforces authentication on route `link` and runs `handler` on successful auth
+func (s *server) AuthenticatedHandle(link string, h http.Handler) {
+	s.Authenticated(link, h.ServeHTTP)
+}
+
+func (s *server) Handle(link string, h http.Handler) {
+	s.mux.Handle(link, gorillacontext.ClearHandler(h))
+}
+
+// Enforces authentication on route `link` and runs `handler` on successful auth
+func (s *server) Authenticated(link string, handler func(http.ResponseWriter, *http.Request)) {
 	defer trace.End(trace.Begin(""))
 
-	if s.auth != nil {
-		authHandler := func(w http.ResponseWriter, r *http.Request) {
-			user, password, ok := r.BasicAuth()
-			if !ok || !s.auth.Validate(user, password) {
-				w.Header().Add("WWW-Authenticate", "Basic realm=vicadmin")
-				w.WriteHeader(http.StatusUnauthorized)
+	authHandler := func(w http.ResponseWriter, r *http.Request) {
+		websession, _ := s.uss.cookies.Get(r, sessionCookieKey) // ignore error because it is okay if it doesn't exist
+
+		if len(r.TLS.PeerCertificates) > 0 { // the user is authenticated by certificate at connection time
+			usersess := s.uss.Add("root", &rootConfig.Config)
+
+			timeNow, err := usersess.created.MarshalText()
+			if err != nil {
+				// it's probably safe to ignore this error since we just created usersess.created when we called Add() above
+				// but just in case..
+				log.Errorf("Failed to unmarshal time object %+v into text due to error: %s", usersess.created, err)
+				http.Redirect(w, r, authFailure, 302)
 				return
 			}
+
+			websession.Values[sessionCreationTimeKey] = string(timeNow)
+			websession.Values[sessionUsernameKey] = "root"
+			err = websession.Save(r, w)
+			if err != nil {
+				log.Errorf("Could not create session for user authenticated via client certificate due to error \"%s\"", err.Error())
+				http.Redirect(w, r, authFailure, 302)
+				return
+			}
+
+			// user was authenticated via cert
 			handler(w, r)
+			return
 		}
-		s.mux.HandleFunc(link, authHandler)
+
+		c := websession.Values[sessionCreationTimeKey]
+		if c == nil { // no cookie, so redirect to login
+			log.Errorf("No authentication token: %+v", websession.Values)
+			http.Redirect(w, r, authFailure, 302)
+			return
+		}
+
+		// here we have a cookie, but we need to make sure it's not expired:
+		// parse the cookie creation time
+		created, err := time.Parse(time.RFC3339, c.(string))
+		if err != nil {
+			// we pulled this value out of a cookie, so if it doesn't parse, it might've been tampered with
+			// though the cookie's encrypted so that would destroy the whole cookie..
+			// Handling the error in any case:
+			log.Errorf("Couldn't parse time out of retrieved cookie due to error %s", err.Error())
+			http.Redirect(w, r, authFailure, 302)
+			return
+		}
+
+		// cookie exists but is expired
+		if time.Since(created) > sessionExpiration {
+			http.Redirect(w, r, loginPagePath+"?expired", 302)
+			return
+		}
+
+		// if the date on the cookie was valid, then the user is authenticated
+		handler(w, r)
+	}
+	s.mux.Handle(link, gorillacontext.ClearHandler(http.HandlerFunc(authHandler)))
+}
+
+// renders the page for login and handles authorization requests
+func (s *server) loginPage(res http.ResponseWriter, req *http.Request) {
+	defer trace.End(trace.Begin(""))
+	ctx := context.Background()
+	if req.Method == "POST" {
+		// take the form data and use it to try to authenticate with vsphere
+
+		// create a userconfig
+		userconfig := session.Config{
+			Insecure:       false,
+			Thumbprint:     rootConfig.Thumbprint,
+			Keepalive:      rootConfig.Keepalive,
+			ClusterPath:    rootConfig.ClusterPath,
+			DatacenterPath: rootConfig.DatacenterPath,
+			DatastorePath:  rootConfig.DatastorePath,
+			HostPath:       rootConfig.Config.HostPath,
+			PoolPath:       rootConfig.PoolPath,
+		}
+		user := url.UserPassword(req.FormValue("username"), req.FormValue("password"))
+		serviceURL, err := soap.ParseURL(rootConfig.Service)
+		if err != nil {
+			// this could happen for a number of reasons but most likely for a plain ol' auth failure
+			log.Errorf("vSphere service URL was not a valid format; parsing returned error: %s", err)
+			http.Redirect(res, req, authFailure, 302)
+			return
+		}
+
+		serviceURL.User = user
+		userconfig.Service = serviceURL.String()
+
+		// check login
+		usersession, err := vSphereSessionGet(&userconfig)
+		if err != nil || usersession == nil {
+			// something went wrong or we could not authenticate
+			log.Warnf("User %s failed to authenticated at %s", user, time.Now())
+			http.Redirect(res, req, authFailure, 302)
+			return
+		}
+
+		// successful login above; user is authenticated
+		// log out, disregard errors
+		usersession.Client.Logout(context.Background())
+
+		// save user config locally
+		usersess := s.uss.Add(req.FormValue("username"), &userconfig)
+
+		// create a token to save as an encrypted & signed cookie
+		// ignore error because there will be one if the session store does not exist, however, it will be created
+		websession, _ := s.uss.cookies.Get(req, sessionCookieKey)
+
+		timeNow, err := usersess.created.MarshalText()
+		if err != nil {
+			log.Errorf("Failed to unmarshal time object %+v into text due to error: %s", usersess.created, err)
+			http.Redirect(res, req, authFailure, 500)
+			return
+		}
+		websession.Values[sessionCreationTimeKey] = string(timeNow)
+		websession.Values[sessionUsernameKey] = req.FormValue("username")
+		if err := websession.Save(req, res); err != nil {
+			log.Errorf("\"%s\" occurred while trying to save session to browser", err.Error())
+			http.Redirect(res, req, authFailure, 500)
+			return
+		}
+
+		// redirect to dashboard
+		http.Redirect(res, req, "/", 302)
 		return
 	}
 
-	s.mux.HandleFunc(link, handler)
+	// Render login page (shows up on non-POST requests):
+	sess, err := client(&rootConfig)
+	if err != nil {
+		log.Errorf("Could not render login page due to vSphere connection error: %s", err.Error())
+		http.Redirect(res, req, "/", 500)
+		return
+	}
+	v := vicadmin.NewValidator(ctx, &vchConfig, sess)
+	tmpl, err := template.ParseFiles("auth.html")
+	err = tmpl.ExecuteTemplate(res, "auth.html", v)
+	if err != nil {
+		log.Errorf("Error parsing template: %s", err)
+		http.Redirect(res, req, "/", 500)
+		return
+	}
 }
 
 func (s *server) serve() error {
@@ -127,35 +298,39 @@ func (s *server) serve() error {
 
 	s.mux = http.NewServeMux()
 
+	// s.mux.HandleFunc bypasses authentication
+	s.mux.HandleFunc(loginPagePath, s.loginPage)
+
 	// tar of appliance system logs
-	s.mux.HandleFunc("/logs.tar.gz", s.tarDefaultLogs)
-	s.handleFunc("/logs.zip", s.zipDefaultLogs)
+	s.Authenticated("/logs.tar.gz", s.tarDefaultLogs)
+	s.Authenticated("/logs.zip", s.zipDefaultLogs)
 
 	// tar of appliance system logs + container logs
-	s.mux.HandleFunc("/container-logs.tar.gz", s.tarContainerLogs)
-	s.handleFunc("/container-logs.zip", s.zipContainerLogs)
+	s.Authenticated("/container-logs.tar.gz", s.tarContainerLogs)
+	s.Authenticated("/container-logs.zip", s.zipContainerLogs)
 
-	s.mux.Handle("/css/", http.StripPrefix("/css/", http.FileServer(http.Dir("css/"))))
-	s.mux.Handle("/images/", http.StripPrefix("/images/", http.FileServer(http.Dir("images/"))))
-	s.mux.Handle("/fonts/", http.StripPrefix("/fonts/", http.FileServer(http.Dir("fonts/"))))
+	// these assets bypass authentication & are world-readable
+	s.Handle("/css/", http.StripPrefix("/css/", http.FileServer(http.Dir("css/"))))
+	s.Handle("/images/", http.StripPrefix("/images/", http.FileServer(http.Dir("images/"))))
+	s.Handle("/fonts/", http.StripPrefix("/fonts/", http.FileServer(http.Dir("fonts/"))))
 
 	for _, path := range logFiles() {
 		name := filepath.Base(path)
 		p := path
 
 		// get single log file (no tail)
-		s.handleFunc("/logs/"+name, func(w http.ResponseWriter, r *http.Request) {
+		s.Authenticated("/logs/"+name, func(w http.ResponseWriter, r *http.Request) {
 			http.ServeFile(w, r, p)
 		})
 
 		// get single log file (with tail)
-		s.handleFunc("/logs/tail/"+name, func(w http.ResponseWriter, r *http.Request) {
+		s.Authenticated("/logs/tail/"+name, func(w http.ResponseWriter, r *http.Request) {
 			s.tailFiles(w, r, []string{p})
 		})
 	}
 
-	//s.handleFunc("/", s.index)
-	s.mux.HandleFunc("/", s.index)
+	s.Authenticated("/logout", s.logoutHandler)
+	s.Authenticated("/", s.index)
 	server := &http.Server{
 		Handler: s.mux,
 	}
@@ -177,36 +352,51 @@ func (s *server) stop() error {
 	return nil
 }
 
+// logout handler expires the user's session cookie by setting its creation time to the beginning of time
+func (s *server) logoutHandler(res http.ResponseWriter, req *http.Request) {
+	websession, err := s.uss.cookies.Get(req, sessionCookieKey)
+	if err != nil {
+		// if there's no session store, probably calling logout doesn't make much sense
+		http.Redirect(res, req, authFailure, 302)
+		return
+	}
+
+	// ignore parsing/marshalling errors because we're parsing a hardcoded beginning-of-time string
+	beginningOfTime, _ := time.Parse(time.RFC3339, "1970-01-01T00:00:00Z")
+	timeText, _ := beginningOfTime.MarshalText()
+	websession.Values[sessionCreationTimeKey] = string(timeText)
+	if err := websession.Save(req, res); err != nil {
+		http.Redirect(res, req, "/", 500)
+		return
+	}
+	s.uss.Delete(websession.Values[sessionUsernameKey].(string))
+	http.Redirect(res, req, "/", 302)
+}
+
 func (s *server) bundleContainerLogs(res http.ResponseWriter, req *http.Request, f format) {
 	defer trace.End(trace.Begin(""))
 
 	readers := defaultReaders
+	c, err := s.getSessionFromRequest(req)
 
-	if config.Service != "" {
-		c, err := client()
-		if err != nil {
-			log.Errorf("failed to connect: %s", err)
-		} else {
-			// Note: we don't want to Logout() until tarEntries() completes below
-			defer c.Client.Logout(context.Background())
+	// Note: we don't want to Logout() until tarEntries() completes below
+	defer c.Client.Logout(context.Background())
 
-			logs, err := findDatastoreLogs(c)
-			if err != nil {
-				log.Warningf("error searching datastore: %s", err)
-			} else {
-				for key, rdr := range logs {
-					readers[key] = rdr
-				}
-			}
+	logs, err := findDatastoreLogs(c)
+	if err != nil {
+		log.Warningf("error searching datastore: %s", err)
+	} else {
+		for key, rdr := range logs {
+			readers[key] = rdr
+		}
+	}
 
-			logs, err = findDiagnosticLogs(c)
-			if err != nil {
-				log.Warningf("error collecting diagnostic logs: %s", err)
-			} else {
-				for key, rdr := range logs {
-					readers[key] = rdr
-				}
-			}
+	logs, err = findDiagnosticLogs(c)
+	if err != nil {
+		log.Warningf("error collecting diagnostic logs: %s", err)
+	} else {
+		for key, rdr := range logs {
+			readers[key] = rdr
 		}
 	}
 
@@ -277,7 +467,7 @@ func (s *server) tailFiles(res http.ResponseWriter, req *http.Request, names []s
 func (s *server) index(res http.ResponseWriter, req *http.Request) {
 	defer trace.End(trace.Begin(""))
 	ctx := context.Background()
-	sess, err := client()
+	sess, err := s.getSessionFromRequest(req)
 	v := vicadmin.NewValidator(ctx, &vchConfig, sess)
 
 	tmpl, err := template.ParseFiles("dashboard.html")

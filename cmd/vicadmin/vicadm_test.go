@@ -63,11 +63,9 @@ func init() {
 	insecureClient = &http.Client{Transport: transport}
 	flag.Set("docker-host", u.Host)
 
-	config.hostCertFile = "fixtures/vicadmin_test_cert.pem"
-	config.hostKeyFile = "fixtures/vicadmin_test_pkey.pem"
+	cert, cerr := ioutil.ReadFile("fixtures/vicadmin_test_cert.pem")
+	key, kerr := ioutil.ReadFile("fixtures/vicadmin_test_pkey.pem")
 
-	cert, cerr := ioutil.ReadFile(config.hostCertFile)
-	key, kerr := ioutil.ReadFile(config.hostKeyFile)
 	if kerr != nil || cerr != nil {
 		panic("unable to load test certificate")
 	}
@@ -90,6 +88,31 @@ func (c *credentials) Validate(u string, p string) bool {
 	return u == c.username && p == c.password
 }
 
+func getServer(t *testing.T) (s *server, port int, cookies *http.CookieJar) {
+
+	s = &server{
+		addr: "127.0.0.1:0",
+	}
+
+	err := s.listen()
+	assert.NoError(t, err)
+	port = s.listenPort()
+
+	data := url.Values{}
+	data.Set("username", "root")
+	data.Set("password", "password")
+	res, err := insecureClient.PostForm(loginPagePath, data)
+	if err != nil {
+		log.Printf("failed to login: %s", err.Error())
+		return nil, 0, nil
+	}
+
+	if res != nil {
+		log.Printf("Got response %+v", res)
+	}
+
+	return
+}
 func TestLoginFailure(t *testing.T) {
 	// Authentication not yet implemented
 	t.SkipNow()
@@ -97,21 +120,12 @@ func TestLoginFailure(t *testing.T) {
 		t.SkipNow()
 	}
 
-	s := &server{
-		addr: "127.0.0.1:0",
-		auth: &credentials{"root", "thisisinsecure"},
-	}
-
-	err := s.listen(true)
-	assert.NoError(t, err)
-
-	port := s.listenPort()
-
+	s, port, _ := getServer(t)
 	go s.serve()
 	defer s.stop()
 
 	var res *http.Response
-	res, err = insecureClient.Get(fmt.Sprintf("https://root:notthepassword@localhost:%d/", port))
+	res, err := insecureClient.Get(fmt.Sprintf("https://root:notthepassword@localhost:%d/", port))
 	assert.NoError(t, err)
 	assert.Equal(t, http.StatusUnauthorized, res.StatusCode)
 }
@@ -123,15 +137,9 @@ func TestNoAuth(t *testing.T) {
 		t.SkipNow()
 	}
 
-	s := &server{
-		addr: "127.0.0.1:0",
-		auth: nil,
-	}
-
-	err := s.listen(true)
+	s, port, _ := getServer(t)
+	err := s.listen()
 	assert.NoError(t, err)
-
-	port := s.listenPort()
 
 	go s.serve()
 	defer s.stop()
@@ -156,10 +164,9 @@ func testLogTar(t *testing.T, plainHTTP bool) {
 
 	s := &server{
 		addr: "127.0.0.1:0",
-		auth: &credentials{"root", "thisisinsecure"},
 	}
 
-	err := s.listen(!plainHTTP)
+	err := s.listen()
 	assert.NoError(t, err)
 
 	port := s.listenPort()
@@ -168,11 +175,7 @@ func testLogTar(t *testing.T, plainHTTP bool) {
 	defer s.stop()
 
 	var res *http.Response
-	if !plainHTTP {
-		res, err = insecureClient.Get(fmt.Sprintf("https://root:thisisinsecure@localhost:%d/container-logs.tar.gz", port))
-	} else {
-		res, err = http.Get(fmt.Sprintf("http://root:thisisinsecure@localhost:%d/container-logs.tar.gz", port))
-	}
+	res, err = insecureClient.Get(fmt.Sprintf("https://root:thisisinsecure@localhost:%d/container-logs.tar.gz", port))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,10 +234,9 @@ func TestLogTail(t *testing.T) {
 
 	s := &server{
 		addr: "127.0.0.1:0",
-		// auth: &credentials{"root", "thisisinsecure"},
 	}
 
-	err = s.listen(true)
+	err = s.listen()
 	assert.NoError(t, err)
 
 	port := s.listenPort()
