@@ -110,12 +110,12 @@ func init() {
 	// os.Exit(1)
 	// }
 
-	flag.StringVar(&config.addr, "l", "client.localhost:2378", "Listen address")
+	flag.StringVar(&rootConfig.addr, "l", "client.localhost:2378", "Listen address")
 
 	// TODO: This should all be pulled from the config
-	flag.StringVar(&config.DatacenterPath, "dc", "", "Path of the datacenter")
-	flag.StringVar(&config.ClusterPath, "cluster", "", "Path of the cluster")
-	flag.StringVar(&config.PoolPath, "pool", "", "Path of the resource pool")
+	flag.StringVar(&rootConfig.DatacenterPath, "dc", "", "Path of the datacenter")
+	flag.StringVar(&rootConfig.ClusterPath, "cluster", "", "Path of the cluster")
+	flag.StringVar(&rootConfig.PoolPath, "pool", "", "Path of the resource pool")
 
 	// load the vch config
 	src, err := extraconfig.GuestInfoSource()
@@ -485,7 +485,7 @@ func main() {
 	rootConfig.DatastorePath = vchConfig.Storage.ImageStores[0].Host
 
 	if vchConfig.Diagnostics.DebugLevel > 2 {
-		config.addr = "0.0.0.0:2378"
+		rootConfig.addr = "0.0.0.0:2378"
 		log.Warn("Listening on all networks because of debug level")
 	}
 	s := &server{

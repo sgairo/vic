@@ -63,11 +63,8 @@ func init() {
 	insecureClient = &http.Client{Transport: transport}
 	flag.Set("docker-host", u.Host)
 
-	rootConfig.hostCertFile = "fixtures/vicadmin_test_cert.pem"
-	rootConfig.hostKeyFile = "fixtures/vicadmin_test_pkey.pem"
-
-	cert, cerr := ioutil.ReadFile(rootConfig.hostCertFile)
-	key, kerr := ioutil.ReadFile(rootConfig.hostKeyFile)
+	cert, cerr := ioutil.ReadFile("fixtures/vicadmin_test_cert.pem")
+	key, kerr := ioutil.ReadFile("fixtures/vicadmin_test_pkey.pem")
 
 	if kerr != nil || cerr != nil {
 		panic("unable to load test certificate")
@@ -91,6 +88,31 @@ func (c *credentials) Validate(u string, p string) bool {
 	return u == c.username && p == c.password
 }
 
+func getServer(t *testing.T) (s *server, port int, cookies *http.CookieJar) {
+
+	s = &server{
+		addr: "127.0.0.1:0",
+	}
+
+	err := s.listen()
+	assert.NoError(t, err)
+	port = s.listenPort()
+
+	data := url.Values{}
+	data.Set("username", "root")
+	data.Set("password", "password")
+	res, err := insecureClient.PostForm(loginPagePath, data)
+	if err != nil {
+		log.Printf("failed to login: %s", err.Error())
+		return nil, 0, nil
+	}
+
+	if res != nil {
+		log.Printf("Got response %+v", res)
+	}
+
+	return
+}
 func TestLoginFailure(t *testing.T) {
 	// Authentication not yet implemented
 	t.SkipNow()
@@ -98,20 +120,12 @@ func TestLoginFailure(t *testing.T) {
 		t.SkipNow()
 	}
 
-	s := &server{
-		addr: "127.0.0.1:0",
-	}
-
-	err := s.listen()
-	assert.NoError(t, err)
-
-	port := s.listenPort()
-
+	s, port, _ := getServer(t)
 	go s.serve()
 	defer s.stop()
 
 	var res *http.Response
-	res, err = insecureClient.Get(fmt.Sprintf("https://root:notthepassword@localhost:%d/", port))
+	res, err := insecureClient.Get(fmt.Sprintf("https://root:notthepassword@localhost:%d/", port))
 	assert.NoError(t, err)
 	assert.Equal(t, http.StatusUnauthorized, res.StatusCode)
 }
@@ -123,14 +137,9 @@ func TestNoAuth(t *testing.T) {
 		t.SkipNow()
 	}
 
-	s := &server{
-		addr: "127.0.0.1:0",
-	}
-
+	s, port, _ := getServer(t)
 	err := s.listen()
 	assert.NoError(t, err)
-
-	port := s.listenPort()
 
 	go s.serve()
 	defer s.stop()
@@ -225,7 +234,6 @@ func TestLogTail(t *testing.T) {
 
 	s := &server{
 		addr: "127.0.0.1:0",
-		// auth: &credentials{"root", "thisisinsecure"},
 	}
 
 	err = s.listen()
