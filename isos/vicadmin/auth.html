@@ -33,18 +33,31 @@
 
     <div class="main-container">
       <main class="content-area">
-        <section class="community-top-section">
-          <h1 id="community">{{.Hostname}} Login</h1>
-          <h4 id="community">{{.Version}}</h4>
-        </section>
+
+	<section>
+	 <div class="row ">
+     <div class="col-md-6 center">
+	
+    <div class="card card-block text-xs-center">
+      <h2 class="card-title">{{.Hostname}} Login</h2>
+ 
         <form method="post">
             <label for="username">vSphere or ESXi Username:</label>
             <input type="text" name="username"><br />
-            <label for="password">Password:</label>
-            <input type="password" name="password"><br />
+            <label for="password">vSphere or ESXi Password:</label>
+            <input type="password" name="password"><br /><br/>
             <input type="submit" value="Log in">
         </form>
-      </main>
+      
     </div>
+     </div>
+      </div>
+      </section>
+    </main>
+    </div>
+    
+    
+    
+    
   </body>
 </html>
